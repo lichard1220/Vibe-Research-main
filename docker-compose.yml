@@ -1,0 +1,26 @@
+services:
+  backend:
+    build: ./backend
+    container_name: vibe-research-backend
+    ports:
+      - "8900:8900"
+    environment:
+      # 前端经 nginx 同域代理 /api，本地一般无需改
+      VR_ALLOW_ORIGINS: "http://localhost:5899"
+      # 本地自用可留空；若要防蹭可设强随机值，并在网页「接入 AI」填同一密钥
+      VR_API_KEY: ""
+    volumes:
+      - backend-cache:/app/.cache
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: vibe-research-frontend
+    ports:
+      - "5899:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend-cache:
