@@ -206,6 +206,27 @@ export interface PortfolioData {
   updated: string; last_refresh: string | null;
 }
 
+export type AlertKind = "near_tp" | "near_sl" | "in_tp_zone" | "in_sl_zone";
+
+export interface PortfolioAlert {
+  id: string;
+  ts: string;
+  code: string;
+  name: string;
+  kind: AlertKind | string;
+  price: number;
+  pnl_pct: number;
+  message: string;
+  read: boolean;
+}
+
+export interface PortfolioAlertsData {
+  alerts: PortfolioAlert[];
+  unread: number;
+  last_check: string | null;
+  trading_session: boolean;
+}
+
 // 资金面 / 筹码 / 信号（v3.3 并入，均为「用户查的那只股」的公开数据）
 export interface MarginRow { date: string; rzye: number; rzmre: number; rzche: number; rqye: number; rqmcl: number; rzrqye: number }
 export interface BlockTradeRow { date: string; price: number; close: number; premium_pct: number; vol: number; amount: number; buyer: string; seller: string }
@@ -265,6 +286,10 @@ export const api = {
     request<PortfolioData>(`/portfolio/holding/ranges?code=${encodeURIComponent(code)}`, "PATCH", ranges),
   removeHolding: (code: string) => request<PortfolioData>(`/portfolio/holding?code=${code}`, "DELETE"),
   refreshPortfolio: () => request<PortfolioData>("/portfolio/refresh", "POST"),
+  portfolioAlerts: (since?: string) =>
+    get<PortfolioAlertsData>(`/portfolio/alerts${since ? `?since=${encodeURIComponent(since)}` : ""}`),
+  ackPortfolioAlerts: (body: { ids?: string[]; all?: boolean }) =>
+    request<PortfolioAlertsData>("/portfolio/alerts/ack", "POST", body),
   closePosition: (code: string, date: string, price: number, shares: number, cost: number) =>
     request<PortfolioData>("/portfolio/close", "POST", { code, date, price, shares, cost }),
   removeClosed: (index: number) => request<PortfolioData>(`/portfolio/close?index=${index}`, "DELETE"),

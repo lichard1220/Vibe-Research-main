@@ -27,8 +27,8 @@ import market
 
 app = FastAPI(title="Vibe-Research API", version="0.1.0")
 
-# 每半小时后台刷新持仓数据
-pf.start_scheduler(1800)
+# 交易时段每分钟盯盘持仓止盈/止损（非交易时段降频）
+pf.start_scheduler(60)
 
 # CORS：默认放开（本地自托管友好）；公网部署时用 VR_ALLOW_ORIGINS 收紧成白名单。
 #   例：VR_ALLOW_ORIGINS="https://myhost"  （逗号分隔多个）
@@ -216,11 +216,35 @@ def portfolio_close_remove(index: int = Query(...)):
 
 @app.post("/api/portfolio/refresh")
 def portfolio_refresh():
-    """手动刷新：立即重拉行情算盈亏。"""
+    """手动刷新：立即重拉行情算盈亏，并强制跑一轮止盈/止损检查。"""
     try:
+        pf.check_tp_sl_alerts(force=True)
         return {"data": pf.get_portfolio()}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"刷新失败：{e}") from e
+
+
+class AlertAckIn(BaseModel):
+    ids: list[str] = []
+    all: bool = False
+
+
+@app.get("/api/portfolio/alerts")
+def portfolio_alerts(since: str | None = Query(None)):
+    """持仓止盈/止损告警队列（未读数 + 最近条目）。"""
+    try:
+        return {"data": pf.list_alerts(since=since)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"告警读取异常：{e}") from e
+
+
+@app.post("/api/portfolio/alerts/ack")
+def portfolio_alerts_ack(body: AlertAckIn):
+    """标记告警已读。"""
+    try:
+        return {"data": pf.ack_alerts(body.ids or None, all_=body.all)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"告警确认失败：{e}") from e
 
 
 @app.get("/api/radar")

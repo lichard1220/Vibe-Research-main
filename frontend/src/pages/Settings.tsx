@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { KeyRound, Sparkles, ShieldCheck, Check, Trash2, Terminal } from "lucide-react";
+import { KeyRound, Sparkles, ShieldCheck, Check, Trash2, Terminal, Bell } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { toast } from "sonner";
@@ -64,6 +64,16 @@ export function Settings() {
     saveAccessKey(k);
     setAccessKey(k);
     toast.success(k ? "已保存后端访问密钥（存本地）" : "已清除后端访问密钥");
+  };
+
+  const enableBrowserNotify = async () => {
+    if (typeof Notification === "undefined") {
+      toast.error("当前浏览器不支持系统通知");
+      return;
+    }
+    const p = await Notification.requestPermission();
+    if (p === "granted") toast.success("已开启浏览器通知（触及止盈/止损时弹出）");
+    else toast.error("未获得通知权限");
   };
 
   return (
@@ -181,6 +191,19 @@ export function Settings() {
             </div>
           </div>
         )}
+      </GlassCard>
+
+      {/* 持仓告警：浏览器通知 */}
+      <GlassCard className="mt-4">
+        <h3 className="mb-1 flex items-center gap-1.5 text-sm font-semibold">
+          <Bell className="h-4 w-4 text-primary" /> 持仓告警 · 浏览器通知
+        </h3>
+        <p className="mb-3 text-xs text-muted-foreground">
+          交易时段后端约每分钟检查止盈/止损；看板开着时侧栏铃铛会提示。授权后还可弹系统气泡（标签页在后台也可）。关掉浏览器则收不到，可另配后端 <code className="rounded bg-muted/50 px-1">VR_ALERT_WEBHOOK_URL</code>。
+        </p>
+        <button onClick={enableBrowserNotify} className="rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary hover:bg-primary/25">
+          开启浏览器系统通知
+        </button>
       </GlassCard>
 
       {/* 后端访问密钥：仅当后端部署时设置了 VR_API_KEY（公网防蹭用）才需要填 */}

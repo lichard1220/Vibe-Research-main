@@ -2,6 +2,8 @@
 鉴权中间件 / 持仓 CRUD 与坏文件降级 / 估值脏数据防护 / 涨停池脏数值 /
 空结果不缓存 / akshare 缺失降级 / 无 index 工具调用归位 / CLI 流式超时。
 """
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -32,6 +34,7 @@ def test_api_key_auth(monkeypatch):
 def tmp_pf(tmp_path, monkeypatch):
     monkeypatch.setattr(pf, "CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(pf, "PF_FILE", str(tmp_path / "portfolio.json"))
+    monkeypatch.setattr(pf, "ALERTS_FILE", str(tmp_path / "portfolio_alerts.json"))
     monkeypatch.setattr(
         astock, "tencent_quote",
         lambda codes: {c: {"name": f"股{c}", "price": 10.0, "change_pct": 1.5} for c in codes},
@@ -190,6 +193,58 @@ def test_portfolio_legacy_json_without_ranges(tmp_pf):
     assert h["tp_status"] == "unset"
     assert h["sl_status"] == "unset"
     assert isinstance(h["flags"], list)
+
+
+def test_is_trading_session():
+    # 2026-07-09 周四
+    mon_am = datetime(2026, 7, 9, 10, 0, tzinfo=pf.BEIJING)
+    mon_lunch = datetime(2026, 7, 9, 12, 0, tzinfo=pf.BEIJING)
+    mon_pm = datetime(2026, 7, 9, 14, 0, tzinfo=pf.BEIJING)
+    after = datetime(2026, 7, 9, 15, 30, tzinfo=pf.BEIJING)
+    weekend = datetime(2026, 7, 11, 10, 0, tzinfo=pf.BEIJING)  # 周六
+    assert pf.is_trading_session(mon_am) is True
+    assert pf.is_trading_session(mon_lunch) is False
+    assert pf.is_trading_session(mon_pm) is True
+    assert pf.is_trading_session(after) is False
+    assert pf.is_trading_session(weekend) is False
+
+
+def test_tp_sl_alert_transition_and_dedupe(tmp_pf, monkeypatch):
+    """below → in_zone 出告警；同状态再 tick 不刷；离开后再进入再告。"""
+    client.post("/api/portfolio/holding", json={
+        "code": "600519", "shares": 100, "cost": 10.0,
+        "tp_mode": "pct", "tp_low": 20, "tp_high": 30,
+    })
+    prices = {"600519": 10.0}
+
+    def quote(codes):
+        return {c: {"name": f"股{c}", "price": prices[c], "change_pct": 0.0} for c in codes}
+
+    monkeypatch.setattr(astock, "tencent_quote", quote)
+
+    assert pf.check_tp_sl_alerts(force=True) == []
+    assert client.get("/api/portfolio/alerts").json()["data"]["unread"] == 0
+
+    prices["600519"] = 12.5  # 浮盈 25% → 入止盈带
+    created = pf.check_tp_sl_alerts(force=True)
+    assert len(created) == 1
+    assert created[0]["kind"] == "in_tp_zone"
+    assert client.get("/api/portfolio/alerts").json()["data"]["unread"] == 1
+
+    assert pf.check_tp_sl_alerts(force=True) == []  # 同态不刷
+    assert client.get("/api/portfolio/alerts").json()["data"]["unread"] == 1
+
+    prices["600519"] = 10.0
+    assert pf.check_tp_sl_alerts(force=True) == []
+    prices["600519"] = 12.5
+    created2 = pf.check_tp_sl_alerts(force=True)
+    assert len(created2) == 1
+    assert client.get("/api/portfolio/alerts").json()["data"]["unread"] == 2
+
+    r = client.post("/api/portfolio/alerts/ack", json={"all": True})
+    assert r.status_code == 200
+    assert r.json()["data"]["unread"] == 0
+
 
 # ── full_valuation：一致预期缺「均值」/ '-' 占位不再 502 ─────────────
 

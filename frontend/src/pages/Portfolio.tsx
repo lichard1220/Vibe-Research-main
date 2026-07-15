@@ -257,7 +257,7 @@ export function Portfolio() {
 
       <div className="mb-4 flex items-start gap-2 rounded-lg border border-success/25 bg-success/5 p-3 text-xs text-muted-foreground">
         <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-success" />
-        <span>持仓<b className="text-foreground">只存在你本地</b>，不上传、不进仓库。行情每半小时自动刷新，也可手动刷新。止盈/止损是你自己的参数；近5日动能与标记是客观统计。本产品不提供标的、不给买卖建议。</span>
+        <span>持仓<b className="text-foreground">只存在你本地</b>，不上传、不进仓库。交易时段后台约每分钟检查止盈/止损并写入告警（侧栏铃铛 / toast / 可选浏览器通知）；关掉看板无法弹窗，也可配置后端 <code className="rounded bg-muted/50 px-1">VR_ALERT_WEBHOOK_URL</code>。止盈/止损是你自己的参数；近5日动能与标记是客观统计。本产品不提供标的、不给买卖建议。</span>
       </div>
 
       {totals && holdings.length > 0 && (

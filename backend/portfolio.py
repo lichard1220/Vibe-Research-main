@@ -2,35 +2,48 @@
 
 合规：持仓是用户主动录入的自己的标的（存本地 .cache/portfolio.json，
 gitignore、不上传、不进仓库），不预置任何标的、不含 _SEED 兜底、不做推荐。
-盈亏红涨绿跌（A股口径）。含每半小时后台定时刷新 + 手动刷新。
+盈亏红涨绿跌（A股口径）。交易时段后台每分钟盯盘止盈/止损 + 手动刷新。
 
 扩展：用户自定义止盈/止损区间（pct 或绝对价），以及每次拉取时用日 K
 实时计算近 5 日动能与预警 flags（不落多日快照库）。
+告警队列存 .cache/portfolio_alerts.json，状态迁移才推送。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, Callable
+from urllib import request as urlrequest
 
 import astock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(HERE, ".cache")
 PF_FILE = os.path.join(CACHE_DIR, "portfolio.json")
+ALERTS_FILE = os.path.join(CACHE_DIR, "portfolio_alerts.json")
 BEIJING = timezone(timedelta(hours=8))
 _LOCK = threading.Lock()
+_ALERT_LOCK = threading.Lock()
+_log = logging.getLogger(__name__)
 
 RANGE_KEYS = ("tp_mode", "tp_low", "tp_high", "sl_mode", "sl_low", "sl_high")
 VALID_MODES = ("pct", "price")
+ALERT_KINDS = ("near_tp", "near_sl", "in_tp_zone", "in_sl_zone")
+_ALERT_CAP = 100
+_OFF_SESSION_SLEEP = 1800
+
+# 可注入：单测固定「现在」
+_now_fn: Callable[[], datetime] = lambda: datetime.now(BEIJING)
 
 
 def _now() -> str:
-    return datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M")
+    return _now_fn().strftime("%Y-%m-%d %H:%M")
 
 
 def _load() -> dict:
@@ -475,21 +488,220 @@ def get_portfolio() -> dict:
     }
 
 
-def _refresh_snapshot() -> None:
-    """后台定时任务：刷新时间戳（GET 本就实时算，这里记录后台刷新点）。"""
+# ---------------------------------------------------------------------------
+# 止盈/止损后台盯盘 + 告警队列
+# ---------------------------------------------------------------------------
+
+_KIND_MSG = {
+    "near_tp": "接近你设置的止盈区间",
+    "near_sl": "接近你设置的止损区间",
+    "in_tp_zone": "现价/盈亏已落入你设置的止盈区间",
+    "in_sl_zone": "现价/盈亏已落入你设置的止损区间",
+}
+
+
+def is_trading_session(now: datetime | None = None) -> bool:
+    """A 股交易时段（北京时间）：工作日 09:15–11:30、13:00–15:05。"""
+    dt = now or _now_fn()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=BEIJING)
+    else:
+        dt = dt.astimezone(BEIJING)
+    if dt.weekday() >= 5:
+        return False
+    t = dt.hour * 60 + dt.minute
+    return (9 * 60 + 15 <= t <= 11 * 60 + 30) or (13 * 60 <= t <= 15 * 60 + 5)
+
+
+def _empty_alerts_store() -> dict:
+    return {"alerts": [], "active": {}, "last_check": None}
+
+
+def _load_alerts() -> dict:
+    try:
+        with open(ALERTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return _empty_alerts_store()
+        data.setdefault("alerts", [])
+        data.setdefault("active", {})
+        return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _empty_alerts_store()
+
+
+def _save_alerts(data: dict) -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = ALERTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, ALERTS_FILE)
+
+
+def _tp_sl_kinds(h: dict, price: float, pnl_pct: float) -> set[str]:
+    """轻量评估：仅止盈/止损 near / in_zone，不拉日 K。"""
+    kinds: set[str] = set()
+    tp_status, near_tp = _eval_side("tp", h, price, pnl_pct)
+    sl_status, near_sl = _eval_side("sl", h, price, pnl_pct)
+    if near_tp:
+        kinds.add("near_tp")
+    if near_sl:
+        kinds.add("near_sl")
+    if tp_status == "in_zone":
+        kinds.add("in_tp_zone")
+    if sl_status == "in_zone":
+        kinds.add("in_sl_zone")
+    return kinds
+
+
+def _post_webhook(alerts: list[dict]) -> None:
+    url = os.environ.get("VR_ALERT_WEBHOOK_URL", "").strip()
+    if not url or not alerts:
+        return
+    try:
+        body = json.dumps({"source": "vibe-research", "alerts": alerts}, ensure_ascii=False).encode("utf-8")
+        req = urlrequest.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlrequest.urlopen(req, timeout=8) as resp:
+            resp.read()
+    except Exception as e:  # noqa: BLE001 — Webhook 失败不挡调度
+        _log.warning("告警 Webhook 失败：%s", e)
+
+
+def check_tp_sl_alerts(*, force: bool = False) -> list[dict]:
+    """拉持仓行情，状态「进入」告警态时写入队列；返回本轮新产生的告警。
+
+    force=True 时忽略交易时段（供单测 / 手动触发）。
+    """
+    if not force and not is_trading_session():
+        return []
+
+    with _LOCK:
+        d = _load()
+        holdings = list(d.get("holdings") or [])
+
+    if not holdings:
+        with _ALERT_LOCK:
+            store = _load_alerts()
+            store["last_check"] = _now()
+            store["active"] = {}
+            _save_alerts(store)
+        with _LOCK:
+            d = _load()
+            d["last_refresh"] = _now()
+            _save(d)
+        return []
+
+    codes = [h["code"] for h in holdings]
+    try:
+        quotes = astock.tencent_quote(codes)
+    except Exception:
+        quotes = {}
+
+    new_alerts: list[dict] = []
+    with _ALERT_LOCK:
+        store = _load_alerts()
+        prev_active: dict = dict(store.get("active") or {})
+        next_active: dict = {}
+
+        for h in holdings:
+            code = h["code"]
+            q = quotes.get(code) or {}
+            price = float(q.get("price") or 0.0)
+            shares = float(h["shares"])
+            cost = float(h["cost"])
+            cv = cost * shares
+            pnl_pct = round((price * shares - cv) / cv * 100, 2) if cv else 0.0
+            name = q.get("name") or code
+            kinds = _tp_sl_kinds(h, price, pnl_pct)
+            for kind in kinds:
+                key = f"{code}:{kind}"
+                next_active[key] = True
+                if key in prev_active:
+                    continue  # 仍在同一态 → 不重复告警
+                alert = {
+                    "id": str(uuid.uuid4()),
+                    "ts": _now(),
+                    "code": code,
+                    "name": name,
+                    "kind": kind,
+                    "price": price,
+                    "pnl_pct": pnl_pct,
+                    "message": f"{name}({code}) {_KIND_MSG.get(kind, kind)}（现价 {price}，浮盈 {pnl_pct}%）",
+                    "read": False,
+                }
+                new_alerts.append(alert)
+
+        if new_alerts:
+            store["alerts"] = (new_alerts + list(store.get("alerts") or []))[:_ALERT_CAP]
+        store["active"] = next_active
+        store["last_check"] = _now()
+        _save_alerts(store)
+
     with _LOCK:
         d = _load()
         d["last_refresh"] = _now()
         _save(d)
 
+    if new_alerts:
+        _post_webhook(new_alerts)
+    return new_alerts
 
-def start_scheduler(interval: int = 1800) -> None:
-    """每半小时后台刷新一次持仓数据（daemon 线程）。"""
+
+def list_alerts(since: str | None = None) -> dict:
+    """返回告警列表；since 为时间戳字符串时只返回 ts > since 的条目。"""
+    with _ALERT_LOCK:
+        store = _load_alerts()
+        alerts = list(store.get("alerts") or [])
+    if since:
+        alerts = [a for a in alerts if str(a.get("ts") or "") > since]
+    unread = sum(1 for a in alerts if not a.get("read"))
+    return {
+        "alerts": alerts,
+        "unread": unread,
+        "last_check": store.get("last_check"),
+        "trading_session": is_trading_session(),
+    }
+
+
+def ack_alerts(ids: list[str] | None = None, *, all_: bool = False) -> dict:
+    """标记已读。all_=True 时全部已读；否则按 ids。"""
+    with _ALERT_LOCK:
+        store = _load_alerts()
+        alerts = store.get("alerts") or []
+        if all_:
+            for a in alerts:
+                a["read"] = True
+        elif ids:
+            id_set = set(ids)
+            for a in alerts:
+                if a.get("id") in id_set:
+                    a["read"] = True
+        _save_alerts(store)
+    return list_alerts()
+
+
+def start_scheduler(interval: int = 60) -> None:
+    """交易时段每 interval 秒盯盘止盈/止损；非交易时段约半小时空转。"""
     def loop():
+        # 启动后稍等再跑，避免拖慢 uvicorn 启动
+        time.sleep(min(5, interval))
         while True:
-            time.sleep(interval)
             try:
-                _refresh_snapshot()
-            except Exception:
-                pass
-    threading.Thread(target=loop, daemon=True).start()
+                if is_trading_session():
+                    check_tp_sl_alerts()
+                    time.sleep(interval)
+                else:
+                    time.sleep(_OFF_SESSION_SLEEP)
+            except Exception as e:  # noqa: BLE001
+                _log.warning("持仓盯盘异常：%s", e)
+                time.sleep(interval)
+
+    threading.Thread(target=loop, daemon=True, name="portfolio-tp-sl-watcher").start()
+
+
+# 兼容旧测试 / 调用名
+def _refresh_snapshot() -> None:
+    check_tp_sl_alerts(force=True)

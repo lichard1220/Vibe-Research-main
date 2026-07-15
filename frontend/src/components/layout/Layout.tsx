@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useDarkMode } from "@/hooks/useDarkMode";
+import { AlertBell } from "@/components/ui/AlertBell";
 
 const APP_VERSION = "v0.1.0";
 const REPO_URL = "https://github.com/lichard1220/Vibe-Research-main";
@@ -117,6 +118,7 @@ export function Layout() {
         <div className={cn("border-t border-border/50", collapsed ? "flex flex-col items-center gap-2 p-2" : "space-y-2 p-3")}>
           {collapsed ? (
             <>
+              <AlertBell collapsed />
               <button onClick={toggle} className="rounded p-1.5 text-muted-foreground transition-colors hover:text-foreground" title={dark ? "亮色" : "暗色"}>
                 {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
               </button>
@@ -130,6 +132,7 @@ export function Layout() {
           ) : (
             <>
               <div className="flex items-center justify-between">
+                <AlertBell />
                 <button onClick={toggle} className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground">
                   {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
                   {dark ? "亮色" : "暗色"}
